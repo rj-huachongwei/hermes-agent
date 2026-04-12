@@ -59,6 +59,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -92,7 +93,6 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
-DEDUP_WINDOW_SECONDS = 300
 DEDUP_MAX_SIZE = 1000
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -172,7 +172,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._pending_responses: Dict[str, asyncio.Future] = {}
-        self._seen_messages: Dict[str, float] = {}
+        self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
 
         # Text batching: merge rapid successive messages (Telegram-style).
@@ -250,7 +250,7 @@ class WeComAdapter(BasePlatformAdapter):
             await self._http_client.aclose()
             self._http_client = None
 
-        self._seen_messages.clear()
+        self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
@@ -476,7 +476,7 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
-        if self._is_duplicate(msg_id):
+        if self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
         self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
@@ -636,6 +636,13 @@ class WeComAdapter(BasePlatformAdapter):
                 if voice_text:
                     text_parts.append(voice_text)
 
+            # Extract appmsg title (filename) for WeCom AI Bot attachments
+            if msgtype == "appmsg":
+                appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
+                title = str(appmsg.get("title") or "").strip()
+                if title:
+                    text_parts.append(title)
+
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
         if quote_type == "text":
@@ -668,6 +675,13 @@ class WeComAdapter(BasePlatformAdapter):
                 refs.append(("image", body["image"]))
             if msgtype == "file" and isinstance(body.get("file"), dict):
                 refs.append(("file", body["file"]))
+            # Handle appmsg (WeCom AI Bot attachments with PDF/Word/Excel)
+            if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+                appmsg = body["appmsg"]
+                if isinstance(appmsg.get("file"), dict):
+                    refs.append(("file", appmsg["file"]))
+                elif isinstance(appmsg.get("image"), dict):
+                    refs.append(("image", appmsg["image"]))
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
@@ -696,7 +710,11 @@ class WeComAdapter(BasePlatformAdapter):
 
             if kind == "image":
                 ext = self._detect_image_ext(raw)
-                return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
+                try:
+                    return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
+                except ValueError as exc:
+                    logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
+                    return None
 
             filename = str(media.get("filename") or media.get("name") or "wecom_file")
             return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -722,7 +740,11 @@ class WeComAdapter(BasePlatformAdapter):
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
         if kind == "image":
             ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
-            return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+            try:
+                return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+            except ValueError as exc:
+                logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
+                return None
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
         return cache_document_from_bytes(raw, filename), content_type
@@ -816,24 +838,6 @@ class WeComAdapter(BasePlatformAdapter):
                 return value
         wildcard = self._groups.get("*")
         return wildcard if isinstance(wildcard, dict) else {}
-
-    def _is_duplicate(self, msg_id: str) -> bool:
-        now = time.time()
-        if len(self._seen_messages) > DEDUP_MAX_SIZE:
-            cutoff = now - DEDUP_WINDOW_SECONDS
-            self._seen_messages = {
-                key: ts for key, ts in self._seen_messages.items() if ts > cutoff
-            }
-            if self._reply_req_ids:
-                self._reply_req_ids = {
-                    key: value for key, value in self._reply_req_ids.items() if key in self._seen_messages
-                }
-
-        if msg_id in self._seen_messages:
-            return True
-
-        self._seen_messages[msg_id] = now
-        return False
 
     def _remember_reply_req_id(self, message_id: str, req_id: str) -> None:
         normalized_message_id = str(message_id or "").strip()

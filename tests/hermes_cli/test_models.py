@@ -6,8 +6,7 @@ from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, menu_labels, model_ids, detect_provider_for_model,
     filter_nous_free_models, _NOUS_ALLOWED_FREE_MODELS,
     is_nous_free_tier, partition_nous_models_by_tier,
-    check_nous_free_tier, clear_nous_free_tier_cache,
-    _FREE_TIER_CACHE_TTL,
+    check_nous_free_tier, _FREE_TIER_CACHE_TTL,
 )
 import hermes_cli.models as _models_mod
 
@@ -16,6 +15,7 @@ LIVE_OPENROUTER_MODELS = [
     ("qwen/qwen3.6-plus", ""),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
 ]
+
 
 
 class TestModelIds:
@@ -64,6 +64,7 @@ class TestMenuLabels:
             labels = menu_labels()
         for label in labels[1:]:
             assert "recommended" not in label.lower(), f"Unexpected 'recommended' in '{label}'"
+
 
 
 class TestOpenRouterModels:
@@ -355,12 +356,10 @@ class TestCheckNousFreeTierCache:
     """Tests for the TTL cache on check_nous_free_tier()."""
 
     def setup_method(self):
-        """Reset cache before each test."""
-        clear_nous_free_tier_cache()
+        _models_mod._free_tier_cache = None
 
     def teardown_method(self):
-        """Reset cache after each test."""
-        clear_nous_free_tier_cache()
+        _models_mod._free_tier_cache = None
 
     @patch("hermes_cli.models.fetch_nous_account_tier")
     @patch("hermes_cli.models.is_nous_free_tier", return_value=True)
@@ -374,7 +373,6 @@ class TestCheckNousFreeTierCache:
 
         assert result1 is True
         assert result2 is True
-        # fetch_nous_account_tier should only be called once (cached on second call)
         assert mock_fetch.call_count == 1
 
     @patch("hermes_cli.models.fetch_nous_account_tier")
@@ -387,7 +385,6 @@ class TestCheckNousFreeTierCache:
             result1 = check_nous_free_tier()
             assert mock_fetch.call_count == 1
 
-            # Simulate TTL expiry by backdating the cache timestamp
             cached_result, cached_at = _models_mod._free_tier_cache
             _models_mod._free_tier_cache = (cached_result, cached_at - _FREE_TIER_CACHE_TTL - 1)
 
@@ -396,15 +393,6 @@ class TestCheckNousFreeTierCache:
 
         assert result1 is False
         assert result2 is False
-
-    def test_clear_cache_forces_refresh(self):
-        """clear_nous_free_tier_cache() invalidates the cached result."""
-        # Manually seed the cache
-        import time
-        _models_mod._free_tier_cache = (True, time.monotonic())
-
-        clear_nous_free_tier_cache()
-        assert _models_mod._free_tier_cache is None
 
     def test_cache_ttl_is_short(self):
         """TTL should be short enough to catch upgrades quickly (<=5 min)."""

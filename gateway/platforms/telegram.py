@@ -60,6 +60,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_image_from_bytes,
     cache_audio_from_bytes,
@@ -146,7 +147,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
-        self._token_lock_identity: Optional[str] = None
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
@@ -299,9 +299,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Exhausted retries — fatal
         message = (
-            "Another Telegram bot poller is already using this token. "
+            "Another process is already polling this Telegram bot token "
+            "(possibly OpenClaw or another Hermes instance). "
             "Hermes stopped Telegram polling after %d retries. "
-            "Make sure only one gateway instance is running for this bot token."
+            "Only one poller can run per token — stop the other process "
+            "and restart with 'hermes start'."
             % MAX_CONFLICT_RETRIES
         )
         logger.error("[%s] %s Original error: %s", self.name, message, error)
@@ -496,27 +498,50 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
-            from gateway.status import acquire_scoped_lock
-
-            self._token_lock_identity = self.config.token
-            acquired, existing = acquire_scoped_lock(
-                "telegram-bot-token",
-                self._token_lock_identity,
-                metadata={"platform": self.platform.value},
-            )
-            if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                message = (
-                    "Another local Hermes gateway is already using this Telegram bot token"
-                    + (f" (PID {owner_pid})." if owner_pid else ".")
-                    + " Stop the other gateway before starting a second Telegram poller."
-                )
-                logger.error("[%s] %s", self.name, message)
-                self._set_fatal_error("telegram_token_lock", message, retryable=False)
+            if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
             # Build the application
             builder = Application.builder().token(self.config.token)
+            custom_base_url = self.config.extra.get("base_url")
+            if custom_base_url:
+                builder = builder.base_url(custom_base_url)
+                builder = builder.base_file_url(
+                    self.config.extra.get("base_file_url", custom_base_url)
+                )
+                logger.info(
+                    "[%s] Using custom Telegram base_url: %s",
+                    self.name, custom_base_url,
+                )
+
+            # PTB defaults (pool_timeout=1s) are too aggressive on flaky networks and
+            # can trigger "Pool timeout: All connections in the connection pool are occupied"
+            # during reconnect/bootstrap. Use safer defaults and allow env overrides.
+            def _env_int(name: str, default: int) -> int:
+                try:
+                    return int(os.getenv(name, str(default)))
+                except (TypeError, ValueError):
+                    return default
+
+            def _env_float(name: str, default: float) -> float:
+                try:
+                    return float(os.getenv(name, str(default)))
+                except (TypeError, ValueError):
+                    return default
+
+            request_kwargs = {
+                "connection_pool_size": _env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
+                "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
+                "connect_timeout": _env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
+                "read_timeout": _env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
+                "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
+            }
+
+            proxy_configured = any(
+                (os.getenv(k) or "").strip()
+                for k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
+            )
+            disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on"))
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
                 fallback_ips = await discover_fallback_ips()
@@ -525,16 +550,32 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     ", ".join(fallback_ips),
                 )
-            if fallback_ips:
+
+            if fallback_ips and not proxy_configured and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
                     self.name,
                     ", ".join(fallback_ips),
                 )
-                transport = TelegramFallbackTransport(fallback_ips)
-                request = HTTPXRequest(httpx_kwargs={"transport": transport})
-                get_updates_request = HTTPXRequest(httpx_kwargs={"transport": transport})
-                builder = builder.request(request).get_updates_request(get_updates_request)
+                # Keep request/update pools separate to reduce contention during
+                # polling reconnect + bot API bootstrap/delete_webhook calls.
+                request = HTTPXRequest(
+                    **request_kwargs,
+                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                )
+                get_updates_request = HTTPXRequest(
+                    **request_kwargs,
+                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                )
+            else:
+                if proxy_configured:
+                    logger.info("[%s] Proxy configured; skipping Telegram fallback-IP transport", self.name)
+                elif disable_fallback:
+                    logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
+                request = HTTPXRequest(**request_kwargs)
+                get_updates_request = HTTPXRequest(**request_kwargs)
+
+            builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
             
@@ -681,12 +722,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
             
         except Exception as e:
-            if self._token_lock_identity:
-                try:
-                    from gateway.status import release_scoped_lock
-                    release_scoped_lock("telegram-bot-token", self._token_lock_identity)
-                except Exception:
-                    pass
+            self._release_platform_lock()
             message = f"Telegram startup failed: {e}"
             self._set_fatal_error("telegram_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
@@ -712,12 +748,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._app.shutdown()
             except Exception as e:
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, e, exc_info=True)
-        if self._token_lock_identity:
-            try:
-                from gateway.status import release_scoped_lock
-                release_scoped_lock("telegram-bot-token", self._token_lock_identity)
-            except Exception as e:
-                logger.warning("[%s] Error releasing Telegram token lock: %s", self.name, e, exc_info=True)
+        self._release_platform_lock()
 
         for task in self._pending_photo_batch_tasks.values():
             if task and not task.done():
@@ -728,7 +759,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         self._app = None
         self._bot = None
-        self._token_lock_identity = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -2732,7 +2762,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_id and message_id:
             await self._set_reaction(chat_id, message_id, "\U0001f440")
 
-    async def on_processing_complete(self, event: MessageEvent, success: bool) -> None:
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
 
         Unlike Discord (additive reactions), Telegram's set_message_reaction
@@ -2742,5 +2772,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\u2705" if success else "\u274c")
+        if chat_id and message_id and outcome != ProcessingOutcome.CANCELLED:
+            await self._set_reaction(
+                chat_id,
+                message_id,
+                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
+            )

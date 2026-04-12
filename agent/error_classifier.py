@@ -82,16 +82,6 @@ class ClassifiedError:
     def is_auth(self) -> bool:
         return self.reason in (FailoverReason.auth, FailoverReason.auth_permanent)
 
-    @property
-    def is_transient(self) -> bool:
-        """Error is expected to resolve on retry (with or without backoff)."""
-        return self.reason in (
-            FailoverReason.rate_limit,
-            FailoverReason.overloaded,
-            FailoverReason.server_error,
-            FailoverReason.timeout,
-            FailoverReason.unknown,
-        )
 
 
 # ── Provider-specific patterns ──────────────────────────────────────────
@@ -122,6 +112,7 @@ _RATE_LIMIT_PATTERNS = [
     "try again in",
     "please retry after",
     "resource_exhausted",
+    "rate increased too quickly",  # Alibaba/DashScope throttling
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -734,6 +725,7 @@ def _classify_by_message(
             FailoverReason.auth,
             retryable=False,
             should_rotate_credential=True,
+            should_fallback=True,
         )
 
     # Model not found patterns
