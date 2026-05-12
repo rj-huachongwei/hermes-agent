@@ -43,6 +43,10 @@ INSTALL_POLICY = {
     "builtin":       ("allow",  "allow",   "allow"),
     "trusted":       ("allow",  "allow",   "block"),
     "community":     ("allow",  "block",   "block"),
+    # Agent-created: "ask" on dangerous surfaces as an error to the agent,
+    # which can retry without the flagged content. This gate only runs when
+    # skills.guard_agent_created is enabled (off by default) — see
+    # tools/skill_manager_tool.py::_guard_agent_created_enabled.
     "agent-created": ("allow",  "allow",   "ask"),
 }
 
@@ -810,7 +814,7 @@ def _check_structure(skill_dir: Path) -> List[Finding]:
             ))
 
         # Executable permission on non-script files
-        if ext not in ('.sh', '.bash', '.py', '.rb', '.pl') and f.stat().st_mode & 0o111:
+        if ext not in {'.sh', '.bash', '.py', '.rb', '.pl'} and f.stat().st_mode & 0o111:
             findings.append(Finding(
                 pattern_id="unexpected_executable",
                 severity="medium",
@@ -872,55 +876,6 @@ def _unicode_char_name(char: str) -> str:
     return names.get(char, f"U+{ord(char):04X}")
 
 
-def _parse_llm_response(text: str, skill_name: str) -> List[Finding]:
-    """Parse the LLM's JSON response into Finding objects."""
-    import json as json_mod
-
-    # Extract JSON from the response (handle markdown code blocks)
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
-
-    try:
-        data = json_mod.loads(text)
-    except json_mod.JSONDecodeError:
-        return []
-
-    if not isinstance(data, dict):
-        return []
-
-    findings = []
-    for item in data.get("findings", []):
-        if not isinstance(item, dict):
-            continue
-        desc = item.get("description", "")
-        severity = item.get("severity", "medium")
-        if severity not in ("critical", "high", "medium", "low"):
-            severity = "medium"
-        if desc:
-            findings.append(Finding(
-                pattern_id="llm_audit",
-                severity=severity,
-                category="llm-detected",
-                file="(LLM analysis)",
-                line=0,
-                match=desc[:120],
-                description=f"LLM audit: {desc}",
-            ))
-
-    return findings
-
-
-def _get_configured_model() -> str:
-    """Load the user's configured model from ~/.hermes/config.yaml."""
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        return config.get("model", "")
-    except Exception:
-        return ""
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -973,5 +928,5 @@ def _build_summary(name: str, source: str, trust: str, verdict: str, findings: L
     if not findings:
         return f"{name}: clean scan, no threats detected"
 
-    categories = set(f.category for f in findings)
+    categories = {f.category for f in findings}
     return f"{name}: {verdict} — {len(findings)} finding(s) in {', '.join(sorted(categories))}"
